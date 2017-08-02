@@ -14,12 +14,9 @@
 # limitations under the License.
 # ==============================================================================
 """Tests for the image plugin summary generation functions."""
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-
-import hashlib
 
 import numpy as np
 import six
@@ -34,9 +31,6 @@ class SummaryTest(tf.test.TestCase):
   def setUp(self):
     super(SummaryTest, self).setUp()
     tf.reset_default_graph()
-    self.stubs = tf.test.StubOutForTesting()
-    self.stubs.Set(summary, '_encode_png', self.stub_for_encode_png)
-    self.stubs.Set(tf.image, 'encode_png', self.stub_for_tf_encode_png)
 
     self.image_width = 300
     self.image_height = 75
@@ -45,34 +39,9 @@ class SummaryTest(tf.test.TestCase):
     self.images = self._generate_images(channels=3)
     self.images_with_alpha = self._generate_images(channels=4)
 
-  def tearDown(self):
-    self.stubs.CleanUp()
-    super(SummaryTest, self).tearDown()
-
   def _generate_images(self, channels):
     size = [self.image_count, self.image_width, self.image_height, channels]
     return np.random.uniform(low=0, high=255, size=size).astype(np.uint8)
-
-  def stub_for_encode_png(self, data_array):
-    data_str = str(data_array)  # numpy will truncate this value
-    data_bytes = data_array.tobytes()  # this is not truncated
-    hashed = hashlib.sha256(data_bytes).hexdigest()
-    prefix = data_str[:64]
-    suffix = data_str[-64:]
-    digest = '%r...[%s]...%r' % (prefix, hashed, suffix)
-    return tf.compat.as_bytes('shape:%r;length:%s;digest:%s'
-                              % (data_array.shape, len(data_bytes), digest))
-
-  def stub_for_tf_encode_png(self, data_tensor):
-    f = tf.py_func(self.stub_for_encode_png,
-                   [data_tensor],
-                   Tout=tf.string,
-                   stateful=False)
-    # The shape needs to be statically known. In the real code, it's
-    # correctly inferred, but we have to set it manually here because we
-    # use a `py_func`.
-    f.set_shape([])  # PNG text is a string scalar (rank-0)
-    return f
 
   def pb_via_op(self, summary_op, feed_dict=None):
     with tf.Session() as sess:
@@ -161,16 +130,15 @@ class SummaryTest(tf.test.TestCase):
     self.assertEqual(tf.compat.as_bytes(str(self.image_width)), result[0])
     self.assertEqual(tf.compat.as_bytes(str(self.image_height)), result[1])
 
-    # Check fake PNG data (verifying that the image was passed to the
-    # encoder correctly).
+    # Check actual image dimensions.
     images = result[2:]
-    shape = (self.image_width, self.image_height, channel_count)
-    shape_tag = tf.compat.as_bytes('shape:%r;' % (shape, ))
-    for image in images:
-      self.assertTrue(
-          image.startswith(shape_tag),
-          'expected fake image data to start with %r, but found: %r'
-          % (shape_tag, image[:len(shape_tag) * 2]))
+    with tf.Session() as sess:
+      placeholder = tf.placeholder(tf.string)
+      decoder = tf.image.decode_png(placeholder)
+      for image in images:
+        decoded = sess.run(decoder, feed_dict={placeholder: image})
+        self.assertEqual((self.image_width, self.image_height, channel_count),
+                         decoded.shape)
 
   def test_dimensions(self):
     self._test_dimensions(alpha=False)
@@ -191,6 +159,68 @@ class SummaryTest(tf.test.TestCase):
   def test_requires_rank_4_in_pb(self):
     with six.assertRaisesRegex(self, ValueError, 'must have rank 4'):
       summary.pb('mona_lisa', np.array([[1, 2, 3], [4, 5, 6]]))
+
+
+class TensorFlowPNGEncoderTest(tf.test.TestCase):
+  """Additional tests for the private `_TensorFlowPNGEncoder` class.
+
+  The functionality of this class is tested via the `SummaryTest` (via
+  the `summary.pb` function). This class tests how it interacts with
+  other graphs and sessions---namely, not at all!
+  """
+
+  def setUp(self):
+    super(TensorFlowPNGEncoderTest, self).setUp()
+
+    patch = tf.test.mock.patch('tensorflow.Session', wraps=tf.Session)
+    patch.start()
+    self.addCleanup(patch.stop)
+
+    self._encoder = summary._TensorFlowPNGEncoder()
+    self._rgb = np.arange(12 * 34 * 3).reshape((12, 34, 3))
+    self._rgba = np.arange(21 * 43 * 4).reshape((21, 43, 4))
+
+  def _check_png(self, data):
+    # If it has a valid PNG header, we can assume it did the right
+    # thing. We trust the `encode_png` op.
+    self.assertEqual(b'\x89PNG', data[:4])
+
+  def test_encodes_png(self):
+    data = self._encoder.encode(self._rgb)
+    self._check_png(data)
+
+  def test_encodes_png_with_alpha(self):
+    data = self._encoder.encode(self._rgba)
+    self._check_png(data)
+
+  def test_preserves_existing_graph(self):
+    tf.constant(1) + tf.constant(2)  # pylint: disable=expression-not-assigned
+    original_graph = tf.get_default_graph()
+    original_proto = original_graph.as_graph_def().SerializeToString()
+    assert len(original_proto) > 10, original_graph
+    self._encoder.encode(self._rgb)
+    self.assertIs(original_graph, tf.get_default_graph())
+    self.assertEqual(original_proto,
+                     tf.get_default_graph().as_graph_def().SerializeToString())
+
+  def test_preserves_existing_session(self):
+    with tf.Session() as sess:
+      op = tf.reduce_sum([2, 2])
+      self.assertIs(sess, tf.get_default_session())
+      data = self._encoder.encode(self._rgb)
+      self._check_png(data)
+      self.assertIs(sess, tf.get_default_session())
+      number_of_lights = sess.run(op)
+      self.assertEqual(number_of_lights, 4)
+
+  def test_lazily_initializes_sessions(self):
+    self.assertEqual(tf.Session.call_count, 0)
+
+  def test_reuses_sessions(self):
+    self._encoder.encode(self._rgb)
+    self.assertEqual(tf.Session.call_count, 1)
+    self._encoder.encode(self._rgb)
+    self.assertEqual(tf.Session.call_count, 1)
 
 
 if __name__ == '__main__':

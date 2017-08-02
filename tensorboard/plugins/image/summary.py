@@ -22,6 +22,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import threading
+
 import numpy as np
 import tensorflow as tf
 
@@ -129,7 +131,35 @@ def pb(name, images, max_outputs=3, display_name=None, description=None):
   return summary
 
 
+class _TensorFlowPNGEncoder(object):
+
+  def __init__(self):
+    super(_TensorFlowPNGEncoder, self).__init__()
+    self._session = None
+    self._image_placeholder = None
+    self._encode_op = None
+    self._initialization_lock = threading.Lock()
+
+  def _lazily_initialize(self):
+    with self._initialization_lock:
+      if self._session:
+        return
+      graph = tf.Graph()
+      with graph.as_default():
+        self._image_placeholder = tf.placeholder(
+            dtype=tf.uint8, name='image_to_encode')
+        self._encode_op = tf.image.encode_png(self._image_placeholder)
+      self._session = tf.Session(graph=graph)
+
+  def encode(self, image):
+    self._lazily_initialize()
+    return self._session.run(self._encode_op,
+                             feed_dict={self._image_placeholder: image})
+
+
+_encoder = _TensorFlowPNGEncoder()
+
+
 def _encode_png(image):
-  # TODO(@wchargin): Pick a third-party PNG backend and implement this.
-  del image
-  raise NotImplementedError('Encoding PNGs in Python is not yet supported.')
+  # We use a TensorFlow backend to encode images from Python.
+  return _encoder.encode(image)
